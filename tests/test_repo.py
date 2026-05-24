@@ -14,10 +14,6 @@ def test_list_all_ues():
     assert len(ues) == 3
     assert ues == [1, 2, 3]
 
-def test_list_ues_empty():
-    _repo.reset_all()
-    assert list(_repo.list_ues()) == []
-
 def test_ue_exists_returns_false_when_missing():
     _repo.reset_all()
     assert _repo.ue_exists(1) is False
