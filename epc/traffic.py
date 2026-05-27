@@ -6,6 +6,8 @@ from concurrent.futures import Future
 from .models import BearerConfig, ThroughputStats
 from .db import EPCRepository
 
+MAX_TOTAL_TRAFFIC_BPS = 100_000_000
+
 # Dedicated background asyncio loop for traffic tasks (works inside test threadpool)
 _traffic_loop = asyncio.new_event_loop()
 
@@ -48,6 +50,16 @@ class TrafficGeneratorManager:
             raise ValueError("Traffic already running")
         if not bearer.target_bps or not bearer.protocol:
             raise ValueError("Bearer not configured for traffic")
+        if bearer.target_bps > MAX_TOTAL_TRAFFIC_BPS:
+            raise ValueError("Traffic exceeds 100 Mbps limit")
+        state = self.repo.get_ue(ue_id)
+        active_total = sum(
+            current.target_bps or 0
+            for current_id, current in state.bearers.items()
+            if current_id != bearer.bearer_id and current.active
+        )
+        if active_total + bearer.target_bps > MAX_TOTAL_TRAFFIC_BPS:
+            raise ValueError("Traffic exceeds 100 Mbps limit")
         future = asyncio.run_coroutine_threadsafe(
             self._run_simulated_bearer(ue_id, bearer.bearer_id, bearer.target_bps, bearer.protocol),
             _traffic_loop,

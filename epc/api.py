@@ -20,7 +20,7 @@ from .models import (
     UEListResponse,
 )
 from .db import EPCRepository
-from .traffic import get_traffic_manager
+from .traffic import MAX_TOTAL_TRAFFIC_BPS, get_traffic_manager
 
 router = APIRouter()
 
@@ -32,6 +32,16 @@ def get_repo() -> EPCRepository:
     if _repo_singleton is None:
         _repo_singleton = EPCRepository()
     return _repo_singleton
+
+
+def _active_bps_total_excluding(state, bearer_id: int) -> int:
+    total = 0
+    for current_id, bearer in state.bearers.items():
+        if current_id == bearer_id:
+            continue
+        if bearer.active and bearer.target_bps:
+            total += bearer.target_bps
+    return total
 
 
 @router.get("/ues/stats", response_model=AggregatedStatsResponse)
@@ -55,6 +65,7 @@ def get_ues_stats(
             if ue_id is not None:
                 raise HTTPException(status_code=400, detail="UE not found")
             continue
+        bearer_count += len(state.bearers)
         for b_id, stats in state.stats.items():
             end_ts = time.time() if (stats.start_ts and tm.is_running(uid, b_id)) else stats.last_update_ts
             duration = (end_ts - stats.start_ts) if (stats.start_ts and end_ts is not None) else 0
@@ -62,7 +73,6 @@ def get_ues_stats(
             rx_bps = int(stats.bytes_rx * 8 / duration) if duration > 0 else 0
             total_tx += tx_bps
             total_rx += rx_bps
-            bearer_count += 1
             if include_details:
                 details.setdefault(str(uid), {})[str(b_id)] = tx_bps
     scope = f"ue:{ue_id}" if ue_id is not None else "all"
@@ -162,27 +172,34 @@ def start_traffic(
     bearer = state.bearers.get(bearer_id)
     if not bearer:
         raise HTTPException(status_code=400, detail="Bearer not found")
+    if target_bps > MAX_TOTAL_TRAFFIC_BPS:
+        raise HTTPException(status_code=400, detail="Traffic exceeds 100 Mbps limit")
+    if _active_bps_total_excluding(state, bearer_id) + target_bps > MAX_TOTAL_TRAFFIC_BPS:
+        raise HTTPException(status_code=400, detail="Traffic exceeds 100 Mbps limit")
+    tm = get_traffic_manager(repo)
+    if tm.is_running(ue_id, bearer_id) is True:
+        raise HTTPException(status_code=400, detail="Traffic already running")
     bearer.protocol = body.protocol.lower()
     bearer.target_bps = target_bps
     bearer.active = True
-    repo.update_bearer(ue_id, bearer)
-    from .models import ThroughputStats
-
-    if bearer_id not in state.stats:
-        initial_stats = ThroughputStats(
-            bearer_id=bearer_id,
-            ue_id=ue_id,
-            start_ts=time.time(),
-            last_update_ts=time.time(),
-            protocol=bearer.protocol,
-            target_bps=target_bps,
-        )
-        repo.update_stats(ue_id, initial_stats)
-    tm = get_traffic_manager(repo)
     try:
         tm.start(ue_id, bearer)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    repo.update_bearer(ue_id, bearer)
+    from .models import ThroughputStats
+
+    if bearer_id not in state.stats:
+        now = time.time()
+        initial_stats = ThroughputStats(
+            bearer_id=bearer_id,
+            ue_id=ue_id,
+            start_ts=now,
+            last_update_ts=now,
+            protocol=bearer.protocol,
+            target_bps=target_bps,
+        )
+        repo.update_stats(ue_id, initial_stats)
     return TrafficStartResponse(
         status="traffic_started",
         ue_id=ue_id,
